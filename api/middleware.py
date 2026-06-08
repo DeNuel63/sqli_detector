@@ -1,153 +1,165 @@
 """
-SQL Injection Detection API — Middleware Helpers
-=================================================
-Drop-in middleware for the three most common Python web frameworks.
-Each middleware extracts all user-supplied parameters from an incoming
-request and runs them through the detection model before the request
-reaches your application code.
+SQL Injection Detection middleware helpers.
 
-Usage:
-    Flask   → register_flask_middleware(app)
-    FastAPI → app.add_middleware(SQLiDetectionMiddleware)
-    Django  → add 'api.middleware.DjangoSQLiMiddleware' to MIDDLEWARE
+This module lets the trained ML detector run before application route code.
+It supports two integration styles:
 
-⚠  CLASS IMBALANCE REMINDER
-    In production, 99%+ of traffic is benign. The default threshold
-    of 0.35 is already tuned for this. Monitor your false positive
-    rate for the first week after deployment and adjust if needed.
+- in-process middleware for Flask, FastAPI/Starlette, and Django
+- shared extraction/scanning helpers used by the standalone FastAPI scanner
 """
 
 import json
 import logging
-from urllib.parse import urlparse, parse_qs
-from typing import Callable, Optional
+import os
+from typing import Callable, Iterable, Optional
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("sqli_detector")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared parameter extractor
-# Works on any raw HTTP request data — used by all three middlewares.
-# ─────────────────────────────────────────────────────────────────────────────
-
+DEFAULT_THRESHOLD = 0.35
+DEFAULT_SKIP_PATHS = {
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/health",
+    "/favicon.ico",
+}
 SCANNABLE_HEADERS = {"user-agent", "referer", "x-forwarded-for", "origin"}
 
+
+def get_threshold(default: float = DEFAULT_THRESHOLD) -> float:
+    """Read SQLI_THRESHOLD from the environment with a safe fallback."""
+    raw_value = os.getenv("SQLI_THRESHOLD")
+    if raw_value is None:
+        return default
+
+    try:
+        threshold = float(raw_value)
+    except ValueError:
+        logger.warning("Invalid SQLI_THRESHOLD=%r; using %.2f", raw_value, default)
+        return default
+
+    if not 0.0 <= threshold <= 1.0:
+        logger.warning("SQLI_THRESHOLD=%r outside 0..1; using %.2f", raw_value, default)
+        return default
+
+    return threshold
+
+
 def extract_params(
-    url:       Optional[str]  = None,
+    url: Optional[str] = None,
     form_data: Optional[dict] = None,
     json_body: Optional[dict] = None,
-    headers:   Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> dict:
     """
-    Extract all user-supplied string values from an HTTP request.
-    Returns a dict of {param_name: value} for every scannable field.
+    Extract user-controlled string values from an HTTP request.
 
-    Scans:
-      - URL query string parameters (?id=1&name=foo)
-      - POST form fields
-      - JSON body values (nested dicts are flattened)
-      - A safe subset of HTTP headers
+    Scans URL query values, form fields, JSON body values, and a small allowlist
+    of headers that commonly contain attacker-controlled content.
     """
     params = {}
 
-    # URL query string
     if url:
         parsed = urlparse(url)
-        for key, values in parse_qs(parsed.query).items():
+        query = parsed.query if parsed.query else url.lstrip("?")
+        for key, values in parse_qs(query, keep_blank_values=True).items():
             for i, val in enumerate(values):
                 param_key = key if len(values) == 1 else f"{key}[{i}]"
                 params[f"url:{param_key}"] = val
 
-    # Form fields
     if form_data:
         for key, val in form_data.items():
-            params[f"form:{key}"] = str(val)
+            params[f"form:{key}"] = _stringify_value(val)
 
-    # JSON body (flatten nested structure)
     if json_body:
         for key, val in _flatten_dict(json_body).items():
-            params[f"json:{key}"] = str(val)
+            params[f"json:{key}"] = _stringify_value(val)
 
-    # Headers (only the subset likely to carry injection)
     if headers:
         for header, val in headers.items():
             if header.lower() in SCANNABLE_HEADERS:
-                params[f"header:{header}"] = str(val)
+                params[f"header:{header}"] = _stringify_value(val)
 
     return params
 
 
-def _flatten_dict(d: dict, prefix: str = "") -> dict:
-    """Recursively flatten a nested dict into dot-separated keys."""
+def _flatten_dict(data: dict, prefix: str = "") -> dict:
+    """Flatten nested JSON-like dictionaries into dot-separated keys."""
     result = {}
-    for key, val in d.items():
-        full_key = f"{prefix}.{key}" if prefix else key
+    for key, val in data.items():
+        full_key = f"{prefix}.{key}" if prefix else str(key)
         if isinstance(val, dict):
             result.update(_flatten_dict(val, full_key))
         elif isinstance(val, list):
             for i, item in enumerate(val):
+                item_key = f"{full_key}[{i}]"
                 if isinstance(item, dict):
-                    result.update(_flatten_dict(item, f"{full_key}[{i}]"))
+                    result.update(_flatten_dict(item, item_key))
                 else:
-                    result[f"{full_key}[{i}]"] = str(item)
+                    result[item_key] = _stringify_value(item)
         else:
-            result[full_key] = str(val)
+            result[full_key] = _stringify_value(val)
     return result
 
 
+def _stringify_value(value) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
 def scan_params(params: dict, pipeline: dict, threshold: float) -> dict:
-    """
-    Run all extracted parameters through the model.
-    Returns a summary dict with blocked status and per-param results.
-    """
+    """Run extracted parameters through the ML model."""
     from src.predict import predict
 
-    results      = []
-    sqli_params  = []
+    results = []
+    sqli_params = []
 
     for name, value in params.items():
-        if not value or not value.strip():
+        value = _stringify_value(value)
+        if not value.strip():
             continue
+
         result = predict(value, pipeline, threshold=threshold)
         result["param_name"] = name
         results.append(result)
+
         if result["label"] == 1:
             sqli_params.append(name)
             logger.warning(
-                f"SQLi detected | param={name} | "
-                f"confidence={result['confidence']} | "
-                f"risk={result['risk_level']} | "
-                f"query={value[:120]!r}"
+                "sqli_detected param=%s confidence=%s risk=%s sample=%r",
+                name,
+                result["confidence"],
+                result["risk_level"],
+                value[:120],
             )
 
     return {
-        "blocked":      len(sqli_params) > 0,
-        "sqli_params":  sqli_params,
+        "blocked": len(sqli_params) > 0,
+        "sqli_params": sqli_params,
         "total_params": len(results),
-        "results":      results,
+        "results": results,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Flask middleware
-# ─────────────────────────────────────────────────────────────────────────────
+def register_flask_middleware(
+    app,
+    pipeline: dict,
+    threshold: Optional[float] = None,
+    skip_paths: Optional[Iterable[str]] = None,
+):
+    """Register SQLi detection as a Flask before_request hook."""
+    from flask import jsonify, request
 
-def register_flask_middleware(app, pipeline: dict, threshold: float = 0.35):
-    """
-    Register SQLi detection as a Flask before_request hook.
-    Blocks any request where at least one parameter is flagged.
-
-    Usage:
-        from api.middleware import register_flask_middleware
-        from src.predict    import load_pipeline
-
-        pipeline = load_pipeline()
-        register_flask_middleware(app, pipeline, threshold=0.35)
-    """
-    from flask import request, abort, jsonify
+    threshold = get_threshold() if threshold is None else threshold
+    skip_paths = set(DEFAULT_SKIP_PATHS if skip_paths is None else skip_paths)
 
     @app.before_request
     def _sqli_check():
+        if request.path in skip_paths:
+            return None
+
         params = extract_params(
             url=request.url,
             form_data=request.form.to_dict() if request.form else None,
@@ -155,126 +167,179 @@ def register_flask_middleware(app, pipeline: dict, threshold: float = 0.35):
             headers=dict(request.headers),
         )
         scan = scan_params(params, pipeline, threshold)
+
         if scan["blocked"]:
-            logger.warning(f"Request blocked | path={request.path} | "
-                           f"flagged_params={scan['sqli_params']}")
-            return jsonify({
-                "error":       "Forbidden",
-                "reason":      "SQL injection attempt detected",
-                "flagged":     scan["sqli_params"],
-                "risk_levels": [r["risk_level"] for r in scan["results"]
-                                if r["label"] == 1],
-            }), 403
+            logger.warning(
+                "request_blocked framework=flask path=%s flagged=%s",
+                request.path,
+                scan["sqli_params"],
+            )
+            return jsonify(
+                {
+                    "error": "Forbidden",
+                    "reason": "SQL injection attempt detected",
+                    "flagged": scan["sqli_params"],
+                    "risk_levels": [
+                        r["risk_level"] for r in scan["results"] if r["label"] == 1
+                    ],
+                }
+            ), 403
 
+        return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI / Starlette middleware
-# ─────────────────────────────────────────────────────────────────────────────
 
 class SQLiDetectionMiddleware:
     """
-    ASGI middleware for FastAPI / Starlette.
-    Intercepts every request and blocks any that contain SQLi.
+    ASGI middleware for FastAPI and Starlette.
 
-    Usage:
-        from fastapi           import FastAPI
-        from api.middleware    import SQLiDetectionMiddleware
-        from src.predict       import load_pipeline
-
-        pipeline = load_pipeline()
-        app      = FastAPI()
-        app.add_middleware(SQLiDetectionMiddleware,
-                           pipeline=pipeline, threshold=0.35)
+    The middleware consumes the incoming body once, scans JSON or URL-encoded
+    form fields, then replays the exact same body to downstream route handlers.
+    That replay step is what keeps normal request parsing working after the
+    security scan runs.
     """
 
-    def __init__(self, app, pipeline: dict, threshold: float = 0.35):
-        self.app       = app
-        self.pipeline  = pipeline
-        self.threshold = threshold
+    def __init__(
+        self,
+        app,
+        pipeline: dict,
+        threshold: Optional[float] = None,
+        skip_paths: Optional[Iterable[str]] = None,
+        max_body_bytes: int = 1_000_000,
+    ):
+        self.app = app
+        self.pipeline = pipeline
+        self.threshold = get_threshold() if threshold is None else threshold
+        self.skip_paths = set(DEFAULT_SKIP_PATHS if skip_paths is None else skip_paths)
+        self.max_body_bytes = max_body_bytes
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        from urllib.parse import parse_qs
-        from starlette.requests  import Request
+        path = scope.get("path", "")
+
+        if path in self.skip_paths:
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.datastructures import Headers
         from starlette.responses import JSONResponse
 
-        request = Request(scope, receive)
+        body, body_too_large = await _read_body(receive, self.max_body_bytes)
+        replay_receive = _make_replay_receive(body)
 
-        # Extract query string
-        query_string = scope.get("query_string", b"").decode("utf-8")
-        url_params   = {}
-        for key, values in parse_qs(query_string).items():
-            for i, val in enumerate(values):
-                url_params[f"url:{key}" if len(values)==1 else f"url:{key}[{i}]"] = val
+        if body_too_large:
+            logger.warning(
+                "request_body_rejected path=%s size_over_limit=%s",
+                path,
+                self.max_body_bytes,
+            )
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "error": "Payload Too Large",
+                    "reason": "Request body exceeds SQLi scanner size limit",
+                    "max_body_bytes": self.max_body_bytes,
+                },
+            )
+            await response(scope, _make_replay_receive(body), send)
+            return
 
-        # Form / JSON body
-        form_data = None
-        json_body = None
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            try:
-                json_body = await request.json()
-            except Exception:
-                pass
-        elif "application/x-www-form-urlencoded" in content_type or \
-             "multipart/form-data" in content_type:
-            try:
-                form = await request.form()
-                form_data = dict(form)
-            except Exception:
-                pass
-
-        all_params = {**url_params}
-        if form_data:
-            all_params.update({f"form:{k}": str(v) for k, v in form_data.items()})
-        if json_body and isinstance(json_body, dict):
-            all_params.update({f"json:{k}": str(v)
-                               for k, v in _flatten_dict(json_body).items()})
-        for header in SCANNABLE_HEADERS:
-            val = request.headers.get(header)
-            if val:
-                all_params[f"header:{header}"] = val
-
-        scan = scan_params(all_params, self.pipeline, self.threshold)
+        headers = Headers(scope=scope)
+        params = _extract_asgi_params(scope, headers, body, self.max_body_bytes)
+        scan = scan_params(params, self.pipeline, self.threshold)
 
         if scan["blocked"]:
-            path = scope.get("path", "")
-            logger.warning(f"Request blocked | path={path} | "
-                           f"flagged_params={scan['sqli_params']}")
+            logger.warning(
+                "request_blocked framework=asgi path=%s method=%s flagged=%s",
+                path,
+                scope.get("method", ""),
+                scan["sqli_params"],
+            )
             response = JSONResponse(
                 status_code=403,
                 content={
-                    "error":   "Forbidden",
-                    "reason":  "SQL injection attempt detected",
+                    "error": "Forbidden",
+                    "reason": "SQL injection attempt detected",
                     "flagged": scan["sqli_params"],
                 },
             )
-            await response(scope, receive, send)
+            await response(scope, _make_replay_receive(body), send)
             return
 
-        await self.app(scope, receive, send)
+        await self.app(scope, replay_receive, send)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Django middleware
-# ─────────────────────────────────────────────────────────────────────────────
+async def _read_body(receive, max_body_bytes: int) -> tuple[bytes, bool]:
+    """Read the ASGI request body up to max_body_bytes."""
+    chunks = []
+    more_body = True
+    total_size = 0
+
+    while more_body:
+        message = await receive()
+        chunk = message.get("body", b"")
+        total_size += len(chunk)
+        if total_size > max_body_bytes:
+            return b"".join(chunks), True
+        chunks.append(chunk)
+        more_body = message.get("more_body", False)
+
+    return b"".join(chunks), False
+
+
+def _make_replay_receive(body: bytes):
+    """Create an ASGI receive callable that replays a previously read body."""
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
+def _extract_asgi_params(scope, headers, body: bytes, max_body_bytes: int) -> dict:
+    query_string = scope.get("query_string", b"").decode("utf-8", errors="replace")
+    params = extract_params(url=f"?{query_string}" if query_string else None)
+
+    content_type = headers.get("content-type", "")
+    if body and len(body) <= max_body_bytes:
+        body_text = body.decode("utf-8", errors="replace")
+        if "application/json" in content_type:
+            try:
+                json_body = json.loads(body_text)
+                if isinstance(json_body, dict):
+                    params.update(extract_params(json_body=json_body))
+            except json.JSONDecodeError:
+                logger.info("request_body_json_parse_failed path=%s", scope.get("path", ""))
+        elif "application/x-www-form-urlencoded" in content_type:
+            form_data = {
+                key: values[-1] if values else ""
+                for key, values in parse_qs(body_text, keep_blank_values=True).items()
+            }
+            params.update(extract_params(form_data=form_data))
+        elif "multipart/form-data" in content_type:
+            logger.info("multipart_body_scan_skipped path=%s", scope.get("path", ""))
+    elif body:
+        logger.info(
+            "request_body_scan_skipped path=%s size=%s max_size=%s",
+            scope.get("path", ""),
+            len(body),
+            max_body_bytes,
+        )
+
+    header_params = extract_params(headers=dict(headers))
+    params.update(header_params)
+    return params
+
 
 class DjangoSQLiMiddleware:
-    """
-    Django WSGI middleware for SQLi detection.
-
-    Add to settings.py:
-        MIDDLEWARE = [
-            'api.middleware.DjangoSQLiMiddleware',
-            ...
-        ]
-
-    The pipeline is loaded once when Django starts.
-    Set SQLI_THRESHOLD in settings.py to override the default (0.35).
-    """
+    """Django middleware for SQLi detection."""
 
     _pipeline = None
 
@@ -282,44 +347,50 @@ class DjangoSQLiMiddleware:
         self.get_response = get_response
         if DjangoSQLiMiddleware._pipeline is None:
             from src.predict import load_pipeline
+
             DjangoSQLiMiddleware._pipeline = load_pipeline()
 
         try:
             from django.conf import settings
-            self.threshold = getattr(settings, "SQLI_THRESHOLD", 0.35)
+
+            self.threshold = getattr(settings, "SQLI_THRESHOLD", get_threshold())
+            self.skip_paths = set(getattr(settings, "SQLI_SKIP_PATHS", DEFAULT_SKIP_PATHS))
         except Exception:
-            self.threshold = 0.35
+            self.threshold = get_threshold()
+            self.skip_paths = set(DEFAULT_SKIP_PATHS)
 
     def __call__(self, request):
         from django.http import JsonResponse
 
-        # Build param dict from Django request
+        if request.path in self.skip_paths:
+            return self.get_response(request)
+
         params = extract_params(
             url=request.get_full_path(),
             form_data=request.POST.dict() if request.method == "POST" else None,
             headers=dict(request.headers),
         )
 
-        # JSON body
-        content_type = request.content_type or ""
-        if "application/json" in content_type:
+        if "application/json" in (request.content_type or ""):
             try:
                 json_body = json.loads(request.body)
                 if isinstance(json_body, dict):
-                    params.update({f"json:{k}": str(v)
-                                   for k, v in _flatten_dict(json_body).items()})
-            except Exception:
-                pass
+                    params.update(extract_params(json_body=json_body))
+            except json.JSONDecodeError:
+                logger.info("django_json_parse_failed path=%s", request.path)
 
         scan = scan_params(params, self._pipeline, self.threshold)
 
         if scan["blocked"]:
-            logger.warning(f"Request blocked | path={request.path} | "
-                           f"flagged_params={scan['sqli_params']}")
+            logger.warning(
+                "request_blocked framework=django path=%s flagged=%s",
+                request.path,
+                scan["sqli_params"],
+            )
             return JsonResponse(
                 {
-                    "error":   "Forbidden",
-                    "reason":  "SQL injection attempt detected",
+                    "error": "Forbidden",
+                    "reason": "SQL injection attempt detected",
                     "flagged": scan["sqli_params"],
                 },
                 status=403,
