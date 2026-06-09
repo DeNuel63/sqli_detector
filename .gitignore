@@ -45,6 +45,8 @@ data/processed/
 # Trained model artifacts
 models/*.pkl
 models/*.joblib
+!models/model.pkl
+!models/tfidf_vectorizer.pkl
 
 # Generated reports and plots
 reports/
