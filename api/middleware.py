@@ -11,6 +11,8 @@ It supports two integration styles:
 import json
 import logging
 import os
+from email import policy
+from email.parser import BytesParser
 from typing import Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -49,7 +51,7 @@ def get_threshold(default: float = DEFAULT_THRESHOLD) -> float:
 def extract_params(
     url: Optional[str] = None,
     form_data: Optional[dict] = None,
-    json_body: Optional[dict] = None,
+    json_body=None,
     headers: Optional[dict] = None,
 ) -> dict:
     """
@@ -70,10 +72,11 @@ def extract_params(
 
     if form_data:
         for key, val in form_data.items():
-            params[f"form:{key}"] = _stringify_value(val)
+            for item_key, item_value in _iter_named_values(str(key), val):
+                params[f"form:{item_key}"] = _stringify_value(item_value)
 
-    if json_body:
-        for key, val in _flatten_dict(json_body).items():
+    if json_body is not None:
+        for key, val in _flatten_json(json_body).items():
             params[f"json:{key}"] = _stringify_value(val)
 
     if headers:
@@ -84,22 +87,36 @@ def extract_params(
     return params
 
 
-def _flatten_dict(data: dict, prefix: str = "") -> dict:
-    """Flatten nested JSON-like dictionaries into dot-separated keys."""
+def _iter_named_values(key: str, value):
+    """Yield one or more named scalar values, preserving repeated fields."""
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            yield key, value[0]
+            return
+        for index, item in enumerate(value):
+            yield f"{key}[{index}]", item
+        return
+
+    yield key, value
+
+
+def _flatten_json(data, prefix: str = "") -> dict:
+    """Flatten JSON-like objects into stable parameter names."""
     result = {}
-    for key, val in data.items():
-        full_key = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(val, dict):
-            result.update(_flatten_dict(val, full_key))
-        elif isinstance(val, list):
-            for i, item in enumerate(val):
-                item_key = f"{full_key}[{i}]"
-                if isinstance(item, dict):
-                    result.update(_flatten_dict(item, item_key))
-                else:
-                    result[item_key] = _stringify_value(item)
-        else:
-            result[full_key] = _stringify_value(val)
+
+    if isinstance(data, dict):
+        for key, val in data.items():
+            full_key = f"{prefix}.{key}" if prefix else str(key)
+            result.update(_flatten_json(val, full_key))
+        return result
+
+    if isinstance(data, list):
+        for index, item in enumerate(data):
+            item_key = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            result.update(_flatten_json(item, item_key))
+        return result
+
+    result[prefix or "$"] = _stringify_value(data)
     return result
 
 
@@ -162,7 +179,7 @@ def register_flask_middleware(
 
         params = extract_params(
             url=request.url,
-            form_data=request.form.to_dict() if request.form else None,
+            form_data=request.form.to_dict(flat=False) if request.form else None,
             json_body=request.get_json(silent=True),
             headers=dict(request.headers),
         )
@@ -313,18 +330,15 @@ def _extract_asgi_params(scope, headers, body: bytes, max_body_bytes: int) -> di
         if "application/json" in content_type:
             try:
                 json_body = json.loads(body_text)
-                if isinstance(json_body, dict):
-                    params.update(extract_params(json_body=json_body))
+                params.update(extract_params(json_body=json_body))
             except json.JSONDecodeError:
                 logger.info("request_body_json_parse_failed path=%s", scope.get("path", ""))
         elif "application/x-www-form-urlencoded" in content_type:
-            form_data = {
-                key: values[-1] if values else ""
-                for key, values in parse_qs(body_text, keep_blank_values=True).items()
-            }
+            form_data = parse_qs(body_text, keep_blank_values=True)
             params.update(extract_params(form_data=form_data))
         elif "multipart/form-data" in content_type:
-            logger.info("multipart_body_scan_skipped path=%s", scope.get("path", ""))
+            form_data = _parse_multipart_form_data(content_type, body)
+            params.update(extract_params(form_data=form_data))
     elif body:
         logger.info(
             "request_body_scan_skipped path=%s size=%s max_size=%s",
@@ -336,6 +350,44 @@ def _extract_asgi_params(scope, headers, body: bytes, max_body_bytes: int) -> di
     header_params = extract_params(headers=dict(headers))
     params.update(header_params)
     return params
+
+
+def _parse_multipart_form_data(content_type: str, body: bytes) -> dict:
+    """Parse text fields from multipart/form-data and skip file content."""
+    raw_message = (
+        f"Content-Type: {content_type}\r\n"
+        "MIME-Version: 1.0\r\n\r\n"
+    ).encode("utf-8") + body
+    message = BytesParser(policy=policy.default).parsebytes(raw_message)
+    form_data = {}
+
+    if not message.is_multipart():
+        return form_data
+
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+
+        field_name = part.get_param("name", header="content-disposition")
+        filename = part.get_param("filename", header="content-disposition")
+        if not field_name or filename is not None:
+            continue
+
+        payload = part.get_payload(decode=True) or b""
+        charset = part.get_content_charset() or "utf-8"
+        value = payload.decode(charset, errors="replace")
+        _append_multi_value(form_data, field_name, value)
+
+    return form_data
+
+
+def _append_multi_value(data: dict, key: str, value: str) -> None:
+    if key not in data:
+        data[key] = value
+    elif isinstance(data[key], list):
+        data[key].append(value)
+    else:
+        data[key] = [data[key], value]
 
 
 class DjangoSQLiMiddleware:
@@ -367,15 +419,14 @@ class DjangoSQLiMiddleware:
 
         params = extract_params(
             url=request.get_full_path(),
-            form_data=request.POST.dict() if request.method == "POST" else None,
+            form_data=dict(request.POST.lists()) if request.method == "POST" else None,
             headers=dict(request.headers),
         )
 
         if "application/json" in (request.content_type or ""):
             try:
                 json_body = json.loads(request.body)
-                if isinstance(json_body, dict):
-                    params.update(extract_params(json_body=json_body))
+                params.update(extract_params(json_body=json_body))
             except json.JSONDecodeError:
                 logger.info("django_json_parse_failed path=%s", request.path)
 

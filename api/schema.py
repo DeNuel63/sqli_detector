@@ -6,7 +6,7 @@ validation and response serialisation.
 """
 
 from pydantic import BaseModel, Field
-from typing   import Optional, List
+from typing import Any, Optional, List
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,16 +59,16 @@ class ScanRequestParams(BaseModel):
         default=None,
         description="Full URL including query string, e.g. /search?q=foo&id=1",
     )
-    form_data: Optional[dict] = Field(
+    form_data: Optional[dict[str, Any]] = Field(
         default=None,
         description="POST form fields as a flat key→value dict.",
         examples=[{"username": "admin", "password": "' OR 1=1--"}],
     )
-    json_body: Optional[dict] = Field(
+    json_body: Optional[Any] = Field(
         default=None,
         description="JSON request body as a dict (nested values are flattened).",
     )
-    headers: Optional[dict] = Field(
+    headers: Optional[dict[str, Any]] = Field(
         default=None,
         description="Request headers to inspect (User-Agent, Referer, etc.)",
     )

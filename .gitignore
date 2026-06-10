@@ -51,3 +51,4 @@ models/*.joblib
 # Generated reports and plots
 reports/
 scripts/
+Chapter 4/

@@ -15,6 +15,7 @@ data/processed/
 data/raw/
 reports/
 notebooks/
+Chapter 4/
 *.log
 .env
 .env.*

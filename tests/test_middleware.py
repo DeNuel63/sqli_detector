@@ -171,6 +171,71 @@ class SQLiDetectionMiddlewareTests(unittest.TestCase):
         self.assertEqual(payload["error"], "Payload Too Large")
         self.assertEqual(payload["max_body_bytes"], 16)
 
+    def test_blocks_sqli_json_root_array(self):
+        body = json.dumps(
+            [
+                {"search": "normal product lookup"},
+                {"password": "' OR 1=1--"},
+            ]
+        ).encode()
+        app = SQLiDetectionMiddleware(echo_body_app, pipeline={}, threshold=0.35)
+
+        status, response_body = asyncio.run(
+            call_asgi(
+                app,
+                body=body,
+                headers=[(b"content-type", b"application/json")],
+            )
+        )
+
+        payload = json.loads(response_body)
+        self.assertEqual(status, 403)
+        self.assertIn("json:[1].password", payload["flagged"])
+
+    def test_blocks_repeated_urlencoded_form_value(self):
+        body = b"tag=safe&tag=%27+OR+1%3D1--"
+        app = SQLiDetectionMiddleware(echo_body_app, pipeline={}, threshold=0.35)
+
+        status, response_body = asyncio.run(
+            call_asgi(
+                app,
+                body=body,
+                headers=[(b"content-type", b"application/x-www-form-urlencoded")],
+            )
+        )
+
+        payload = json.loads(response_body)
+        self.assertEqual(status, 403)
+        self.assertIn("form:tag[1]", payload["flagged"])
+
+    def test_blocks_multipart_text_field(self):
+        boundary = "----sqli-test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="comment"\r\n'
+            "\r\n"
+            "' OR 1=1--\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="upload"; filename="payload.txt"\r\n'
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "' OR 1=1--\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+        app = SQLiDetectionMiddleware(echo_body_app, pipeline={}, threshold=0.35)
+
+        status, response_body = asyncio.run(
+            call_asgi(
+                app,
+                body=body,
+                headers=[(b"content-type", f"multipart/form-data; boundary={boundary}".encode())],
+            )
+        )
+
+        payload = json.loads(response_body)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["flagged"], ["form:comment"])
+
 
 if __name__ == "__main__":
     unittest.main()
